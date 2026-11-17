@@ -2,9 +2,21 @@
 
 厚生労働省の全国8地方厚生局が公表している「コード内容別医療機関一覧表（医科・医科併設・歯科併設）」および日本郵便の郵便番号データ（`utf_ken_all.zip`）を取得・統合し、47都道府県・全保険医療機関の機械可読データセットを構築・検証するパイプラインです。
 
-## 配布データ（GitHub Releases）
+## 配布データ・差分管理の構成
 
-データファイル本体はリポジトリの Git 履歴には含めず、各スナップショット（`YYYYMM`）ごとに **GitHub Releases** のアセットとして配布します。
+### 1. Git 差分管理用（都道府県別 CSV：`data/public/by_pref/`）
+毎月の医療機関の新規開設・廃止・属性変更を `git diff` や GitHub 上で追跡できるよう、都道府県別に分割・安定ソートした公開用 CSV を Git 管理しています。
+
+- `data/public/by_pref/01_hokkaido.csv` 〜 `47_okinawa.csv`（47都道府県）
+- `data/public/LATEST_SNAPSHOT.txt`（現在反映されているスナップショット年月）
+- **除外列**：
+  - 個人情報への配慮：`owner_name`（開設者名）・`manager_name`（管理者名）
+  - 毎月全行に差分が出てしまうメタ列：`snapshot_date`・`source_file`・`source_sheet`・`seq_no`
+- `medical_code_10digit` 順でソートしているため、月次更新時の純粋な施設増減・属性変更のみが差分として記録されます。
+
+### 2. GitHub Releases（各月フルスナップショット）
+
+`snapshot_date` 等を含む全国 1 枚の圧縮ファイルは、各スナップショット（`YYYYMM`）ごとに **GitHub Releases** のアセットとして配布します。
 
 - `hokenshisetsu_nationwide_YYYYMM_public.csv.gz`
   - 全国施設一覧（gzip 圧縮 UTF-8 BOM 付き CSV）。`pandas.read_csv(..., compression="gzip")` でそのまま読み込めます。
