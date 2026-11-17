@@ -49,6 +49,22 @@ python3 subprojects/hokenshisetsu/scripts/export_public_release.py --snapshot 20
 
 出力先は `release/YYYYMM/` に作成されます。
 
+## データ取得元（公式URL）
+
+本パイプラインは以下の公式公開ページから原本ファイルを取得しています。
+
+| 機関・区分 | 取得元 URL |
+|---|---|
+| 北海道厚生局 | https://kouseikyoku.mhlw.go.jp/hokkaido/iryo_shido/hoken-kikan.html |
+| 東北厚生局 | https://kouseikyoku.mhlw.go.jp/tohoku/gyomu/gyomu/hoken_kikan/itiran.html |
+| 関東信越厚生局 | https://kouseikyoku.mhlw.go.jp/kantoshinetsu/chousa/shitei.html |
+| 東海北陸厚生局 | https://kouseikyoku.mhlw.go.jp/tokaihokuriku/gyomu/gyomu/hoken_kikan/shitei.html |
+| 近畿厚生局 | https://kouseikyoku.mhlw.go.jp/kinki/tyousa/shinkishitei.html |
+| 中国四国厚生局 | https://kouseikyoku.mhlw.go.jp/chugokushikoku/chousaka/iryoukikanshitei.html |
+| 四国厚生支局 | https://kouseikyoku.mhlw.go.jp/shikoku/gyomu/gyomu/hoken_kikan/shitei/index.html |
+| 九州厚生局 | https://kouseikyoku.mhlw.go.jp/kyushu/gyomu/gyomu/hoken_kikan/index_00004.html |
+| 日本郵便（郵便番号データ） | https://www.post.japanpost.jp/zipcode/dl/utf/zip/utf_ken_all.zip |
+
 ## 出典・利用上の注意
 
 - 本データは厚生労働省 各地方厚生局が公表している「保険医療機関・保険薬局の指定一覧（コード内容別医療機関一覧表）」および日本郵便株式会社「郵便番号データ（`utf_ken_all.zip`）」をもとに機械的に整形・統合したものです。
