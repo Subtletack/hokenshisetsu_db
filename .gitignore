@@ -1,0 +1,22 @@
+# OS / Editors
+.DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime logs & local raw/processed/release data (distributed via GitHub Releases)
+logs/
+data/
+release/
+subprojects/*/data/
+subprojects/*/output/
+subprojects/*/docs/discovered_targets_*.json
+subprojects/*/docs/download_manifest_*.json
