@@ -14,5 +14,6 @@ cd "$BASE_DIR"
   "$PY_BIN" subprojects/hokenshisetsu/scripts/build_nationwide.py --snapshot "$SNAP"
   "$PY_BIN" subprojects/hokenshisetsu/scripts/verify_nationwide.py --snapshot "$SNAP"
   "$PY_BIN" subprojects/hokenshisetsu/scripts/export_public_release.py --snapshot "$SNAP"
+  "$PY_BIN" subprojects/hokenshisetsu/scripts/track_transitions.py --curr-snapshot "$SNAP"
   echo "=== Finished snapshot=${SNAP} at $(date '+%Y-%m-%d %H:%M:%S') ==="
 } >> "$LOG_FILE" 2>&1

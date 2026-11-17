@@ -9,6 +9,7 @@
 
 - `data/public/by_pref/01_hokkaido.csv` 〜 `47_okinawa.csv`（47都道府県）
 - `data/public/LATEST_SNAPSHOT.txt`（現在反映されているスナップショット年月）
+- `data/public/transitions/`（前月スナップショットが存在する場合、廃止→新規コードのうち **同一施設名・同一住所（NFKC/ハイフン/空白正規化後 1対1一致）** のコード変更を `YYYYMM_code_changes.csv` および累積台帳 `facility_code_history.csv` として自動記録）
 - **除外列**：
   - 個人情報への配慮：`owner_name`（開設者名）・`manager_name`（管理者名）
   - 毎月全行に差分が出てしまうメタ列：`snapshot_date`・`source_file`・`source_sheet`・`seq_no`
