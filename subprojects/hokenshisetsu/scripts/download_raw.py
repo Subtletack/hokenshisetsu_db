@@ -13,8 +13,12 @@ import argparse
 import hashlib
 import html.parser
 import json
+import os
 import re
+import shutil
+import tempfile
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -474,53 +478,381 @@ def discover_targets(snapshot: str) -> list[dict[str, str]]:
     return targets
 
 
-def load_targets(snapshot: str, targets_json: Path | None = None) -> list[dict[str, str]]:
-    path = targets_json or (DOCS_DIR / f"discovered_targets_{snapshot}.json")
-    if path.exists():
+def load_targets(
+    snapshot: str,
+    targets_json: Path | None = None,
+    refresh: bool = False,
+) -> list[dict[str, str]]:
+    if targets_json is not None:
+        targets = json.loads(targets_json.read_text(encoding="utf-8"))
+        validate_discovered_targets(targets, snapshot)
+        return targets
+    path = DOCS_DIR / f"discovered_targets_{snapshot}.json"
+    if path.exists() and not refresh:
         targets = json.loads(path.read_text(encoding="utf-8"))
         validate_discovered_targets(targets, snapshot)
         return targets
     return discover_targets(snapshot)
 
 
-def run_download(snapshot: str, targets: list[dict[str, str]], download_japanpost: bool) -> None:
+def _history_path(snapshot: str) -> Path:
+    return RAW_ROOT / "_archive" / snapshot / "download_history.json"
+
+
+def _load_download_history(snapshot: str) -> dict[str, dict[str, Any]]:
+    hp = _history_path(snapshot)
+    if hp.exists():
+        data = json.loads(hp.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _save_download_history(snapshot: str, history: dict[str, dict[str, Any]]) -> None:
+    hp = _history_path(snapshot)
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=hp.parent, prefix=".download_history.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(history, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp_path, hp)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_downloaded_file(
+    tmp_path: Path,
+    expected_suffix: str,
+    is_kouseikyoku_zip: bool,
+) -> None:
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        raise RuntimeError(f"Downloaded file is empty: {tmp_path.name}")
+    suffix = expected_suffix.lower()
+    if suffix == ".zip":
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            bad_member = zf.testzip()
+            if bad_member is not None:
+                raise RuntimeError(f"Corrupt ZIP member {bad_member!r} in downloaded file")
+        if is_kouseikyoku_zip:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                validate_zip_extraction_plan(tmp_path, Path(tmp_dir))
+    elif suffix in (".xlsx", ".xlsm"):
+        import openpyxl
+
+        with tmp_path.open("rb") as fh:
+            wb = openpyxl.load_workbook(fh, read_only=True, data_only=True)
+            try:
+                if not wb.sheetnames:
+                    raise RuntimeError(f"Excel workbook has no sheets: {tmp_path.name}")
+                ws = wb[wb.sheetnames[0]]
+                next(ws.iter_rows(max_row=1, values_only=True), None)
+            finally:
+                wb.close()
+    elif suffix == ".xls":
+        header = tmp_path.read_bytes()[:8]
+        if header != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            raise RuntimeError(f"Invalid .xls OLE2 header in downloaded file: {tmp_path.name}")
+
+
+def _archive_existing_file(
+    snapshot: str,
+    rel_subdir: str,
+    existing_path: Path,
+    old_sha256: str,
+    old_bytes: int,
+    old_url: str,
+    old_fetched_at_utc: str,
+) -> dict[str, Any]:
+    ts_compact = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_dir = RAW_ROOT / "_archive" / snapshot / rel_subdir
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_name = f"{ts_compact}_{old_sha256[:8]}_{existing_path.name}"
+    archive_path = archive_dir / archive_name
+    shutil.copy2(existing_path, archive_path)
+    return {
+        "archived_at_utc": datetime.now(timezone.utc).isoformat(),
+        "archived_raw_file": str(archive_path.relative_to(REPO_ROOT)),
+        "url": old_url,
+        "sha256": old_sha256,
+        "bytes": old_bytes,
+        "fetched_at_utc": old_fetched_at_utc,
+    }
+
+
+def _fetch_and_sync_file(
+    snapshot: str,
+    url: str,
+    out_path: Path,
+    rel_subdir: str,
+    history: dict[str, dict[str, Any]],
+    headers: dict[str, str],
+    refresh: bool,
+    is_kouseikyoku_zip: bool,
+) -> str:
+    """Fetch URL to temp, validate, detect changes, archive previous version if changed, and atomically replace."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rel_key = str(out_path.relative_to(REPO_ROOT))
+    prev_rec = history.get(rel_key, {})
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    req_headers = dict(headers)
+    if out_path.exists() and not refresh:
+        # Only use conditional HTTP headers if local file still matches recorded history sha256
+        if prev_rec.get("sha256") and prev_rec.get("sha256") == sha256_file(out_path):
+            if prev_rec.get("etag"):
+                req_headers["If-None-Match"] = str(prev_rec["etag"])
+            if prev_rec.get("last_modified"):
+                req_headers["If-Modified-Since"] = str(prev_rec["last_modified"])
+
+    req = urllib.request.Request(url, headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp_etag = resp.headers.get("ETag")
+            resp_last_mod = resp.headers.get("Last-Modified")
+            fd, tmp_name = tempfile.mkstemp(
+                dir=out_path.parent,
+                prefix=f".{out_path.name}.",
+                suffix=".tmp",
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    while True:
+                        chunk = resp.read(1024 * 64)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                _validate_downloaded_file(
+                    tmp_path,
+                    expected_suffix=out_path.suffix,
+                    is_kouseikyoku_zip=is_kouseikyoku_zip,
+                )
+                new_sha256 = sha256_file(tmp_path)
+                new_bytes = tmp_path.stat().st_size
+
+                if out_path.exists():
+                    old_sha256 = sha256_file(out_path)
+                    old_bytes = out_path.stat().st_size
+                    if new_sha256 == old_sha256:
+                        tmp_path.unlink(missing_ok=True)
+                        rec = dict(prev_rec)
+                        rec.update(
+                            {
+                                "url": url,
+                                "sha256": old_sha256,
+                                "bytes": old_bytes,
+                                "fetched_at_utc": prev_rec.get("fetched_at_utc") or now_utc,
+                                "last_checked_at_utc": now_utc,
+                                "etag": resp_etag or prev_rec.get("etag"),
+                                "last_modified": resp_last_mod or prev_rec.get("last_modified"),
+                                "revision_history": list(prev_rec.get("revision_history", [])),
+                            }
+                        )
+                        history[rel_key] = rec
+                        _save_download_history(snapshot, history)
+                        print(f"UNCHANGED (sha256 match): {rel_key} ({old_bytes} bytes)")
+                        return "unchanged"
+
+                    revs = list(prev_rec.get("revision_history", []))
+                    archived_file_created: Path | None = None
+                    if not (revs and revs[-1].get("sha256") == old_sha256):
+                        rev_entry = _archive_existing_file(
+                            snapshot=snapshot,
+                            rel_subdir=rel_subdir,
+                            existing_path=out_path,
+                            old_sha256=old_sha256,
+                            old_bytes=old_bytes,
+                            old_url=str(prev_rec.get("url") or url),
+                            old_fetched_at_utc=str(prev_rec.get("fetched_at_utc") or ""),
+                        )
+                        archived_file_created = REPO_ROOT / rev_entry["archived_raw_file"]
+                        revs.append(rev_entry)
+
+                    new_rec = {
+                        "url": url,
+                        "sha256": new_sha256,
+                        "bytes": new_bytes,
+                        "fetched_at_utc": now_utc,
+                        "last_checked_at_utc": now_utc,
+                        "etag": resp_etag,
+                        "last_modified": resp_last_mod,
+                        "revision_history": revs,
+                    }
+                    history[rel_key] = new_rec
+                    try:
+                        _save_download_history(snapshot, history)
+                    except Exception:
+                        if prev_rec:
+                            history[rel_key] = prev_rec
+                        else:
+                            history.pop(rel_key, None)
+                        if archived_file_created is not None:
+                            archived_file_created.unlink(missing_ok=True)
+                        raise
+
+                    os.replace(tmp_path, out_path)
+                    print(f"UPDATED (archived previous): {rel_key} ({old_bytes} -> {new_bytes} bytes)")
+                    return "updated"
+
+                history[rel_key] = {
+                    "url": url,
+                    "sha256": new_sha256,
+                    "bytes": new_bytes,
+                    "fetched_at_utc": now_utc,
+                    "last_checked_at_utc": now_utc,
+                    "etag": resp_etag,
+                    "last_modified": resp_last_mod,
+                    "revision_history": list(prev_rec.get("revision_history", [])),
+                }
+                try:
+                    _save_download_history(snapshot, history)
+                except Exception:
+                    if prev_rec:
+                        history[rel_key] = prev_rec
+                    else:
+                        history.pop(rel_key, None)
+                    raise
+
+                os.replace(tmp_path, out_path)
+                print(f"DOWNLOADED: {rel_key} ({new_bytes} bytes)")
+                return "downloaded"
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and out_path.exists():
+            rec = dict(prev_rec)
+            rec.update(
+                {
+                    "url": url,
+                    "sha256": sha256_file(out_path),
+                    "bytes": out_path.stat().st_size,
+                    "fetched_at_utc": prev_rec.get("fetched_at_utc") or now_utc,
+                    "last_checked_at_utc": now_utc,
+                    "revision_history": list(prev_rec.get("revision_history", [])),
+                }
+            )
+            history[rel_key] = rec
+            _save_download_history(snapshot, history)
+            print(f"UNCHANGED (HTTP 304): {rel_key} ({out_path.stat().st_size} bytes)")
+            return "unchanged"
+        raise
+
+
+def run_download(
+    snapshot: str,
+    targets: list[dict[str, str]],
+    download_japanpost: bool,
+    refresh: bool = False,
+) -> dict[str, int]:
     raw_base = RAW_ROOT / snapshot
     headers = {"User-Agent": "Mozilla/5.0"}
+    history = _load_download_history(snapshot)
+    counts = {"downloaded": 0, "updated": 0, "unchanged": 0}
+
     for item in targets:
-        out_dir = raw_base / item["bureau_dir"]
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / item["filename"]
-        if out_path.exists():
-            print(f"SKIP (exists): {out_path.relative_to(REPO_ROOT)} ({out_path.stat().st_size} bytes)")
-            continue
-        req = urllib.request.Request(item["url"], headers=headers)
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
-        out_path.write_bytes(data)
-        print(f"DOWNLOADED: {out_path.relative_to(REPO_ROOT)} ({len(data)} bytes)")
+        out_path = raw_base / item["bureau_dir"] / item["filename"]
+        status = _fetch_and_sync_file(
+            snapshot=snapshot,
+            url=item["url"],
+            out_path=out_path,
+            rel_subdir=item["bureau_dir"],
+            history=history,
+            headers=headers,
+            refresh=refresh,
+            is_kouseikyoku_zip=out_path.suffix.lower() == ".zip",
+        )
+        counts[status] += 1
 
     if download_japanpost:
         jp_out = raw_base / "utf_ken_all.zip"
-        if not jp_out.exists():
-            try:
-                req = urllib.request.Request(JAPANPOST_UTF_KEN_ALL_URL, headers=headers)
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    jp_out.write_bytes(resp.read())
-                print(f"DOWNLOADED: {jp_out.relative_to(REPO_ROOT)}")
-            except Exception as exc:
-                fallback = RAW_ROOT / "shared" / "utf_ken_all.zip"
-                if fallback.exists():
-                    print(
-                        f"WARN: Japan Post download failed ({exc}); "
-                        f"using existing fallback {fallback.relative_to(REPO_ROOT)}"
-                    )
-                else:
-                    raise
+        try:
+            _fetch_and_sync_file(
+                snapshot=snapshot,
+                url=JAPANPOST_UTF_KEN_ALL_URL,
+                out_path=jp_out,
+                rel_subdir="japanpost",
+                history=history,
+                headers=headers,
+                refresh=refresh,
+                is_kouseikyoku_zip=False,
+            )
+        except Exception as exc:
+            fallback = RAW_ROOT / "shared" / "utf_ken_all.zip"
+            if jp_out.exists():
+                print(
+                    f"WARN: Japan Post update check failed ({exc}); "
+                    f"keeping existing {jp_out.relative_to(REPO_ROOT)}"
+                )
+            elif fallback.exists():
+                print(
+                    f"WARN: Japan Post download failed ({exc}); "
+                    f"using existing fallback {fallback.relative_to(REPO_ROOT)}"
+                )
+            else:
+                raise
+
+    _save_download_history(snapshot, history)
+    return counts
+
+
+def _extract_dir_matches_plan(extract_root: Path, plan: list[dict[str, Any]]) -> bool:
+    if not extract_root.exists():
+        return False
+    expected_dests: set[Path] = set()
+    for p_entry in plan:
+        if not p_entry["keep"]:
+            continue
+        if not p_entry["exists"] or not p_entry["hash_matches"]:
+            return False
+        expected_dests.add(p_entry["dest"].resolve())
+
+    for existing_file in extract_root.rglob("*"):
+        if existing_file.is_file() and not existing_file.name.startswith("._"):
+            if existing_file.resolve() not in expected_dests:
+                return False
+    return True
+
+
+def _extract_zip_atomically(zip_path: Path, extract_root: Path, plan: list[dict[str, Any]]) -> None:
+    extract_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(dir=extract_root.parent, prefix=f".{extract_root.name}.staging."))
+    backup_dir: Path | None = None
+    extract_root_resolved = extract_root.resolve()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for p_entry in plan:
+                if not p_entry["keep"]:
+                    continue
+                rel_dest = p_entry["dest"].relative_to(extract_root_resolved)
+                stage_dest = staging_dir / rel_dest
+                stage_dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(p_entry["info"], "r") as src:
+                    stage_dest.write_bytes(src.read())
+                if sha256_file(stage_dest) != p_entry["member_sha256"]:
+                    raise RuntimeError(f"Staged extraction hash mismatch for {rel_dest}")
+
+        if extract_root.exists():
+            backup_dir = Path(tempfile.mkdtemp(dir=extract_root.parent, prefix=f".{extract_root.name}.backup."))
+            backup_dir.rmdir()
+            os.replace(extract_root, backup_dir)
+        os.replace(staging_dir, extract_root)
+        if backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        if backup_dir is not None and backup_dir.exists() and not extract_root.exists():
+            os.replace(backup_dir, extract_root)
+        raise
 
 
 def run_extract_and_manifest(snapshot: str, targets: list[dict[str, str]]) -> None:
     raw_base = RAW_ROOT / snapshot
     manifest_path = DOCS_DIR / f"download_manifest_{snapshot}.json"
+    history = _load_download_history(snapshot)
     manifest_items: list[dict[str, Any]] = []
 
     for item in targets:
@@ -528,47 +860,51 @@ def run_extract_and_manifest(snapshot: str, targets: list[dict[str, str]]) -> No
         if not file_path.exists():
             raise FileNotFoundError(f"Missing downloaded file: {file_path}")
 
+        rel_key = str(file_path.relative_to(REPO_ROOT))
+        hist_rec = history.get(rel_key, {})
+        file_sha = sha256_file(file_path)
+
         entry: dict[str, Any] = {
             "bureau_dir": item["bureau_dir"],
             "bureau_name": item["bureau_name"],
             "category": item["category"],
             "url": item["url"],
-            "raw_file": str(file_path.relative_to(REPO_ROOT)),
+            "raw_file": rel_key,
             "bytes": file_path.stat().st_size,
-            "sha256": sha256_file(file_path),
+            "sha256": file_sha,
+            "fetched_at_utc": hist_rec.get("fetched_at_utc"),
+            "last_checked_at_utc": hist_rec.get("last_checked_at_utc"),
+            "etag": hist_rec.get("etag"),
+            "last_modified": hist_rec.get("last_modified"),
+            "revision_history": list(hist_rec.get("revision_history", [])),
             "extracted_files": [],
             "skipped_zip_members": [],
         }
 
         if file_path.suffix.lower() == ".zip":
             extract_root = file_path.parent / "extracted" / file_path.stem
-            extract_root.mkdir(parents=True, exist_ok=True)
             plan = validate_zip_extraction_plan(file_path, extract_root)
-            with zipfile.ZipFile(file_path, "r") as zf:
-                for p_entry in plan:
-                    if not p_entry["keep"]:
-                        entry["skipped_zip_members"].append(
-                            {"member": p_entry["decoded"], "reason": p_entry["reason"]}
-                        )
-                        continue
-                    dest = p_entry["dest"]
-                    if p_entry["exists"]:
-                        if not p_entry["hash_matches"]:
-                            raise RuntimeError(
-                                f"Existing extracted file hash mismatch for {dest.relative_to(REPO_ROOT)}"
-                            )
-                    else:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(p_entry["info"], "r") as src:
-                            dest.write_bytes(src.read())
-                    entry["extracted_files"].append(
-                        {
-                            "path": str(dest.relative_to(REPO_ROOT)),
-                            "bytes": dest.stat().st_size,
-                            "sha256": sha256_file(dest),
-                            "classification": p_entry["reason"],
-                        }
+            for p_entry in plan:
+                if not p_entry["keep"]:
+                    entry["skipped_zip_members"].append(
+                        {"member": p_entry["decoded"], "reason": p_entry["reason"]}
                     )
+
+            if not _extract_dir_matches_plan(extract_root, plan):
+                _extract_zip_atomically(file_path, extract_root, plan)
+
+            for p_entry in plan:
+                if not p_entry["keep"]:
+                    continue
+                dest = p_entry["dest"]
+                entry["extracted_files"].append(
+                    {
+                        "path": str(dest.relative_to(REPO_ROOT)),
+                        "bytes": dest.stat().st_size,
+                        "sha256": sha256_file(dest),
+                        "classification": p_entry["reason"],
+                    }
+                )
 
         manifest_items.append(entry)
 
@@ -583,9 +919,262 @@ def run_extract_and_manifest(snapshot: str, targets: list[dict[str, str]]) -> No
     print(f"Manifest written: {manifest_path.relative_to(REPO_ROOT)}")
 
 
+def run_self_test() -> None:
+    """Offline test for same-month corrections, Excel validation, partial failures, and history safety."""
+    import io
+    import openpyxl
+
+    def make_zip_bytes(members: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, content in members.items():
+                zf.writestr(name, content)
+        return buf.getvalue()
+
+    def make_xlsx_bytes(sheet_title: str, cell_value: str) -> bytes:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_title
+        ws["A1"] = cell_value
+        buf = io.BytesIO()
+        wb.save(buf)
+        wb.close()
+        return buf.getvalue()
+
+    zip_v1 = make_zip_bytes({"01_ika.xlsx": b"v1-excel-bytes", "01_yakkyoku.xlsx": b"skip-pharmacy"})
+    zip_v2 = make_zip_bytes({"01_ika_revised.xlsx": b"v2-revised-excel-bytes"})
+    zip2_v1 = make_zip_bytes({"02_ika.xlsx": b"v1-tohoku-bytes"})
+    zip2_v2 = make_zip_bytes({"02_ika.xlsx": b"v2-tohoku-bytes"})
+    zip2_v3 = make_zip_bytes({"02_ika.xlsx": b"v3-tohoku-bytes"})
+    xlsx_v1 = make_xlsx_bytes("Sheet1", "v1-direct-xlsx")
+    xlsx_v2 = make_xlsx_bytes("Sheet1", "v2-direct-xlsx-revised")
+
+    routes: dict[str, dict[str, Any]] = {
+        "https://example.invalid/hokkaido.zip": {"body": zip_v1, "etag": '"v1"', "status": 200},
+        "https://example.invalid/tohoku.zip": {"body": zip2_v1, "etag": '"t1"', "status": 200},
+        "https://example.invalid/direct.xlsx": {"body": xlsx_v1, "etag": '"x1"', "status": 200},
+    }
+
+    class FakeResponse:
+        def __init__(self, body: bytes, etag: str) -> None:
+            self._bio = io.BytesIO(body)
+            self.headers = {"ETag": etag}
+
+        def read(self, n: int = -1) -> bytes:
+            return self._bio.read(n)
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_urlopen(req: urllib.request.Request, timeout: int = 60) -> FakeResponse:
+        entry = routes[req.full_url]
+        if entry.get("raise_url_error"):
+            raise urllib.error.URLError("simulated network failure")
+        if entry["status"] != 200:
+            raise urllib.error.HTTPError(req.full_url, int(entry["status"]), "err", {}, None)
+        inm = req.get_header("If-none-match") or req.get_header("If-None-Match")
+        if inm and inm == entry["etag"]:
+            raise urllib.error.HTTPError(req.full_url, 304, "Not Modified", {}, None)
+        return FakeResponse(entry["body"], entry["etag"])
+
+    global REPO_ROOT, RAW_ROOT, DOCS_DIR, _save_download_history
+    orig_roots = (REPO_ROOT, RAW_ROOT, DOCS_DIR)
+    orig_urlopen = urllib.request.urlopen
+    orig_save_history = _save_download_history
+    urllib.request.urlopen = fake_urlopen  # type: ignore[assignment]
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            REPO_ROOT = root
+            RAW_ROOT = root / "data" / "raw" / "hokenshisetsu"
+            DOCS_DIR = root / "subprojects" / "hokenshisetsu" / "docs"
+
+            snapshot = "202612"
+            targets = [
+                {
+                    "bureau_dir": "01_hokkaido",
+                    "bureau_name": "北海道厚生局",
+                    "category": "医科",
+                    "url": "https://example.invalid/hokkaido.zip",
+                    "filename": "hokkaido.zip",
+                    "discovered_ym": snapshot,
+                },
+                {
+                    "bureau_dir": "03_kantoshinetsu",
+                    "bureau_name": "関東信越厚生局",
+                    "category": "医科",
+                    "url": "https://example.invalid/direct.xlsx",
+                    "filename": "direct.xlsx",
+                    "discovered_ym": snapshot,
+                },
+            ]
+
+            # 1. Initial download + extract (ZIP + direct Excel)
+            c1 = run_download(snapshot, targets, download_japanpost=False, refresh=False)
+            assert c1 == {"downloaded": 2, "updated": 0, "unchanged": 0}
+            run_extract_and_manifest(snapshot, targets)
+            raw_zip = RAW_ROOT / snapshot / "01_hokkaido" / "hokkaido.zip"
+            ext_dir = RAW_ROOT / snapshot / "01_hokkaido" / "extracted" / "hokkaido"
+            raw_xlsx = RAW_ROOT / snapshot / "03_kantoshinetsu" / "direct.xlsx"
+            assert (ext_dir / "01_ika.xlsx").read_bytes() == b"v1-excel-bytes"
+            assert not (ext_dir / "01_yakkyoku.xlsx").exists()
+            assert raw_xlsx.read_bytes() == xlsx_v1
+
+            # 2. Unchanged re-run (HTTP 304) and forced refresh with identical content
+            c2 = run_download(snapshot, targets, download_japanpost=False, refresh=False)
+            assert c2 == {"downloaded": 0, "updated": 0, "unchanged": 2}
+            c3 = run_download(snapshot, targets, download_japanpost=False, refresh=True)
+            assert c3 == {"downloaded": 0, "updated": 0, "unchanged": 2}
+            assert not (RAW_ROOT / "_archive" / snapshot / "01_hokkaido").exists()
+            assert not (RAW_ROOT / "_archive" / snapshot / "03_kantoshinetsu").exists()
+
+            # 3. Corrupt ZIP rejection preserves existing ZIP & extracted files
+            routes["https://example.invalid/hokkaido.zip"] = {"body": b"not-a-zip-html", "etag": '"badz"', "status": 200}
+            failed = False
+            try:
+                run_download(snapshot, [targets[0]], download_japanpost=False, refresh=True)
+            except Exception:
+                failed = True
+            assert failed, "Corrupt ZIP should have raised an error"
+            assert raw_zip.read_bytes() == zip_v1
+            assert (ext_dir / "01_ika.xlsx").read_bytes() == b"v1-excel-bytes"
+            routes["https://example.invalid/hokkaido.zip"] = {"body": zip_v1, "etag": '"v1"', "status": 200}
+
+            # 4. 4-A: Direct Excel rejection for HTML, empty bytes, corrupt Excel, and plain ZIP
+            for bad_label, bad_bytes in (
+                ("html", b"<html><body>503 Service Unavailable</body></html>"),
+                ("empty", b""),
+                ("corrupt_xlsx", b"PK\x03\x04corrupted-not-xlsx"),
+                ("plain_zip", zip_v1),
+            ):
+                routes["https://example.invalid/direct.xlsx"] = {
+                    "body": bad_bytes,
+                    "etag": f'"{bad_label}"',
+                    "status": 200,
+                }
+                xlsx_failed = False
+                try:
+                    run_download(snapshot, [targets[1]], download_japanpost=False, refresh=True)
+                except Exception:
+                    xlsx_failed = True
+                assert xlsx_failed, f"Invalid direct Excel ({bad_label}) should have failed"
+                assert raw_xlsx.read_bytes() == xlsx_v1, f"Existing Excel changed on {bad_label}"
+
+            # Valid revised direct Excel succeeds and tracks revision history
+            routes["https://example.invalid/direct.xlsx"] = {"body": xlsx_v2, "etag": '"x2"', "status": 200}
+            routes["https://example.invalid/hokkaido.zip"] = {"body": zip_v2, "etag": '"v2"', "status": 200}
+            c4 = run_download(snapshot, targets, download_japanpost=False, refresh=False)
+            assert c4 == {"downloaded": 0, "updated": 2, "unchanged": 0}
+            run_extract_and_manifest(snapshot, targets)
+
+            assert raw_zip.read_bytes() == zip_v2
+            assert raw_xlsx.read_bytes() == xlsx_v2
+            assert not (ext_dir / "01_ika.xlsx").exists(), "Stale extracted file must be removed"
+            assert (ext_dir / "01_ika_revised.xlsx").read_bytes() == b"v2-revised-excel-bytes"
+
+            manifest = json.loads((DOCS_DIR / f"download_manifest_{snapshot}.json").read_text(encoding="utf-8"))
+            assert manifest["items"][0]["sha256"] == sha256_file(raw_zip)
+            assert len(manifest["items"][0]["revision_history"]) == 1
+            assert (root / manifest["items"][0]["revision_history"][0]["archived_raw_file"]).read_bytes() == zip_v1
+            assert manifest["items"][1]["sha256"] == sha256_file(raw_xlsx)
+            assert len(manifest["items"][1]["revision_history"]) == 1
+            assert (root / manifest["items"][1]["revision_history"][0]["archived_raw_file"]).read_bytes() == xlsx_v1
+
+            # 5. 4-B: Multi-file partial failure (item 1 updates, item 2 fails -> recover -> re-run)
+            snapshot_b = "202701"
+            targets_b = [
+                {
+                    "bureau_dir": "01_hokkaido",
+                    "bureau_name": "北海道厚生局",
+                    "category": "医科",
+                    "url": "https://example.invalid/hokkaido.zip",
+                    "filename": "hokkaido.zip",
+                    "discovered_ym": snapshot_b,
+                },
+                {
+                    "bureau_dir": "02_tohoku",
+                    "bureau_name": "東北厚生局",
+                    "category": "医科",
+                    "url": "https://example.invalid/tohoku.zip",
+                    "filename": "tohoku.zip",
+                    "discovered_ym": snapshot_b,
+                },
+            ]
+            routes["https://example.invalid/hokkaido.zip"] = {"body": zip_v1, "etag": '"v1"', "status": 200}
+            routes["https://example.invalid/tohoku.zip"] = {"body": zip2_v1, "etag": '"t1"', "status": 200}
+            run_download(snapshot_b, targets_b, download_japanpost=False, refresh=False)
+            run_extract_and_manifest(snapshot_b, targets_b)
+
+            # Update both to v2, but fail item 2 with network error after item 1 succeeds
+            routes["https://example.invalid/hokkaido.zip"] = {"body": zip_v2, "etag": '"v2"', "status": 200}
+            routes["https://example.invalid/tohoku.zip"] = {
+                "body": zip2_v2,
+                "etag": '"t2"',
+                "status": 200,
+                "raise_url_error": True,
+            }
+            partial_failed = False
+            try:
+                run_download(snapshot_b, targets_b, download_japanpost=False, refresh=False)
+            except urllib.error.URLError:
+                partial_failed = True
+            assert partial_failed
+
+            # Recover item 2 and re-run -> item 1's v1->v2 revision_history must be preserved without duplication
+            routes["https://example.invalid/tohoku.zip"] = {"body": zip2_v2, "etag": '"t2"', "status": 200}
+            c_rec = run_download(snapshot_b, targets_b, download_japanpost=False, refresh=False)
+            assert c_rec == {"downloaded": 0, "updated": 1, "unchanged": 1}
+            # Re-run again -> no duplicate history
+            c_idem = run_download(snapshot_b, targets_b, download_japanpost=False, refresh=True)
+            assert c_idem == {"downloaded": 0, "updated": 0, "unchanged": 2}
+            run_extract_and_manifest(snapshot_b, targets_b)
+
+            man_b = json.loads((DOCS_DIR / f"download_manifest_{snapshot_b}.json").read_text(encoding="utf-8"))
+            assert len(man_b["items"][0]["revision_history"]) == 1
+            assert (root / man_b["items"][0]["revision_history"][0]["archived_raw_file"]).read_bytes() == zip_v1
+            assert len(man_b["items"][1]["revision_history"]) == 1
+            assert (root / man_b["items"][1]["revision_history"][0]["archived_raw_file"]).read_bytes() == zip2_v1
+
+            # 6. 4-B: Simulate history save failure -> raw file must not advance ahead of history; recovery succeeds
+            routes["https://example.invalid/tohoku.zip"] = {"body": zip2_v3, "etag": '"t3"', "status": 200}
+
+            def failing_save_history(snap: str, hist: dict[str, dict[str, Any]]) -> None:
+                raise OSError("simulated disk full saving history")
+
+            _save_download_history = failing_save_history  # type: ignore[assignment]
+            save_failed = False
+            try:
+                run_download(snapshot_b, [targets_b[1]], download_japanpost=False, refresh=False)
+            except OSError:
+                save_failed = True
+            assert save_failed
+            _save_download_history = orig_save_history
+
+            raw_tohoku = RAW_ROOT / snapshot_b / "02_tohoku" / "tohoku.zip"
+            assert raw_tohoku.read_bytes() == zip2_v2, "Raw file must remain at v2 when history save fails"
+
+            c_rec2 = run_download(snapshot_b, [targets_b[1]], download_japanpost=False, refresh=False)
+            assert c_rec2 == {"downloaded": 0, "updated": 1, "unchanged": 0}
+            run_extract_and_manifest(snapshot_b, targets_b)
+            assert raw_tohoku.read_bytes() == zip2_v3
+            man_b2 = json.loads((DOCS_DIR / f"download_manifest_{snapshot_b}.json").read_text(encoding="utf-8"))
+            assert man_b2["items"][1]["sha256"] == sha256_file(raw_tohoku)
+            assert len(man_b2["items"][1]["revision_history"]) == 2
+            assert man_b2["items"][1]["extracted_files"][0]["sha256"] == sha256_file(
+                RAW_ROOT / snapshot_b / "02_tohoku" / "extracted" / "tohoku" / "02_ika.xlsx"
+            )
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _save_download_history = orig_save_history
+        REPO_ROOT, RAW_ROOT, DOCS_DIR = orig_roots
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generalized Kouseikyoku raw downloader.")
-    parser.add_argument("--snapshot", required=True, help="Target snapshot YYYYMM (e.g. 202701)")
+    parser.add_argument("--snapshot", help="Target snapshot YYYYMM (e.g. 202701)")
     parser.add_argument(
         "--mode",
         choices=["discover", "download", "extract", "all"],
@@ -598,7 +1187,21 @@ def main() -> None:
         action="store_true",
         help="Also download latest Japan Post utf_ken_all.zip into snapshot dir",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Re-discover targets (when no --targets-json) and bypass conditional HTTP cache headers",
+    )
+    parser.add_argument("--self-test", action="store_true", help="Run offline unit tests")
     args = parser.parse_args()
+
+    if args.self_test:
+        run_self_test()
+        print("DOWNLOAD_SELF_TEST_PASSED")
+        return
+
+    if not args.snapshot:
+        parser.error("--snapshot is required unless --self-test is specified")
 
     if not re.fullmatch(r"\d{6}", args.snapshot):
         raise ValueError(f"--snapshot must be YYYYMM, got {args.snapshot!r}")
@@ -607,9 +1210,9 @@ def main() -> None:
         discover_targets(args.snapshot)
         return
 
-    targets = load_targets(args.snapshot, args.targets_json)
+    targets = load_targets(args.snapshot, args.targets_json, refresh=args.refresh and args.mode == "all")
     if args.mode in ("download", "all"):
-        run_download(args.snapshot, targets, args.download_japanpost)
+        run_download(args.snapshot, targets, args.download_japanpost, refresh=args.refresh)
     if args.mode in ("extract", "all"):
         run_extract_and_manifest(args.snapshot, targets)
 
