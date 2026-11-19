@@ -153,3 +153,19 @@
 - `removed_at_snapshot`: 消失を検出した年月（`YYYYMM`）
 - `matched_in_snapshot`: 後続月で再出現・照合された年月（未照合の間は空欄）
 - `medical_code_10digit`, `pref_code`, `pref_name`, `facility_name`, `address`, `phone`, `designated_date`: 消失前時点の施設情報
+
+---
+
+## 4. ジオコーディング別添アセット（`hokenshisetsu_geocode_YYYYMM.csv.gz`）
+
+毎年 1 月版（および手動実行した対象月）の GitHub Releases に添付される座標テーブルです。`medical_code_10digit` をキーとして公開全国 CSV または都道府県別 CSV と結合できます。
+
+| 列名 | 型・例 | 説明 |
+|---|---|---|
+| `medical_code_10digit` | 文字列（10桁）例: `0110110210` | 医科医療機関コード 10 桁（結合キー、`medical_code_10digit` 昇順）。 |
+| `latitude` | 浮動小数点文字列 / 空 例: `35.673378` | 緯度（世界測地系・小数点以下 6 桁）。未一致時は空欄。 |
+| `longitude` | 浮動小数点文字列 / 空 例: `139.752212` | 経度（世界測地系・小数点以下 6 桁）。未一致時は空欄。 |
+| `geocode_level` | 文字列 | 判定精度区分：`house_number`（住居番号・号）/ `gaiku`（街区・番）/ `aza`（小字・丁目）/ `oaza_cho`（大字・町丁目）/ `municipality`（市区町村・区）/ `prefecture`（都道府県・郡）/ `unmatched`（未一致）。 |
+| `geocode_level_code` | `"1"`〜`"8"` / 空 | `jageocoder` の数値レベル（`8`: 住居番号, `7`: 街区, `6`: 小字, `5`: 大字, `4`: 区, `3`: 市区町村, `2`: 郡, `1`: 都道府県）。 |
+| `geocode_source` | 文字列 / 空 | 使用したジオコーディング辞書識別子（例：`jageocoder_jukyo_all_v22`）。 |
+| `geocode_matched` | 文字列 / 空 | 住所辞書上で一致した住所文字列。 |

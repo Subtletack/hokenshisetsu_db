@@ -1,0 +1,66 @@
+[
+  {
+    "source_scope": "02_tohoku",
+    "original_codepoint": "U+E0EA",
+    "unicode_replacement": "葛",
+    "evidence_source": "utf_ken_all.zip postal_code=0360172 (青森県平川市葛川田の沢口)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "04_tokaihokuriku",
+    "original_codepoint": "U+E192",
+    "unicode_replacement": "辻",
+    "evidence_source": "utf_ken_all.zip postal_code=4240806 (静岡県静岡市清水区辻)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "04_tokaihokuriku",
+    "original_codepoint": "U+E38B",
+    "unicode_replacement": "吉",
+    "evidence_source": "utf_ken_all.zip postal_code=4211223 (静岡県静岡市葵区吉津)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "04_tokaihokuriku",
+    "original_codepoint": "U+E1D1",
+    "unicode_replacement": "逢",
+    "evidence_source": "utf_ken_all.zip postal_code=4710052 (愛知県豊田市逢妻町)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "05_kinki",
+    "original_codepoint": "U+E192",
+    "unicode_replacement": "辻",
+    "evidence_source": "utf_ken_all.zip postal_code=5690036 (大阪府高槻市辻子), 5430042 (大阪市天王寺区烏ケ辻)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "05_kinki",
+    "original_codepoint": "U+E061",
+    "unicode_replacement": "土",
+    "evidence_source": "utf_ken_all.zip postal_code=6680844 (兵庫県豊岡市土渕)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "06_chugokushikoku",
+    "original_codepoint": "U+E3CD",
+    "unicode_replacement": "祇",
+    "evidence_source": "utf_ken_all.zip postal_code=7310138 (広島県広島市安佐南区祇園); same bureau U+E3CD in 岡山市北区祇園866",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  },
+  {
+    "source_scope": "08_kyushu",
+    "original_codepoint": "U+E0E9",
+    "unicode_replacement": "葛",
+    "evidence_source": "utf_ken_all.zip postal_code=8000008 (福岡県北九州市門司区葛葉)",
+    "verified_at": "2026-11-18",
+    "review_status": "verified"
+  }
+]
