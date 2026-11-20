@@ -81,7 +81,7 @@ python3 subprojects/hokenshisetsu/scripts/export_public_release.py --snapshot 20
 | 中国四国厚生局 | https://kouseikyoku.mhlw.go.jp/chugokushikoku/chousaka/iryoukikanshitei.html |
 | 四国厚生支局 | https://kouseikyoku.mhlw.go.jp/shikoku/gyomu/gyomu/hoken_kikan/shitei/index.html |
 | 九州厚生局 | https://kouseikyoku.mhlw.go.jp/kyushu/gyomu/gyomu/hoken_kikan/index_00004.html |
-| 日本郵便（郵便番号データ） | https://www.post.japanpost.jp/zipcode/dl/utf/zip/utf_ken_all.zip |
+| 日本郵便（郵便番号データ） | https://www.post.japanpost.jp/service/search/zipcode/download/utf/zip/utf_ken_all.zip |
 
 ## 出典・利用上の注意
 

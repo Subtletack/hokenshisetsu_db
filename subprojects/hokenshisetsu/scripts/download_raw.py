@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 RAW_ROOT = REPO_ROOT / "data" / "raw" / "hokenshisetsu"
 DOCS_DIR = REPO_ROOT / "subprojects" / "hokenshisetsu" / "docs"
 
-JAPANPOST_UTF_KEN_ALL_URL = "https://www.post.japanpost.jp/zipcode/dl/utf/zip/utf_ken_all.zip"
+JAPANPOST_UTF_KEN_ALL_URL = "https://www.post.japanpost.jp/service/search/zipcode/download/utf/zip/utf_ken_all.zip"
 
 BUREAU_INDEX_PAGES: list[dict[str, str]] = [
     {
