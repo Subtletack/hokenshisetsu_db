@@ -489,9 +489,13 @@ def load_targets(
         return targets
     path = DOCS_DIR / f"discovered_targets_{snapshot}.json"
     if path.exists() and not refresh:
-        targets = json.loads(path.read_text(encoding="utf-8"))
-        validate_discovered_targets(targets, snapshot)
-        return targets
+        try:
+            targets = json.loads(path.read_text(encoding="utf-8"))
+            validate_discovered_targets(targets, snapshot)
+            return targets
+        except RuntimeError:
+            # Legacy cached targets file (e.g. missing discovered_ym); re-discover from index pages
+            pass
     return discover_targets(snapshot)
 
 
